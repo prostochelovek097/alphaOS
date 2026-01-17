@@ -3,229 +3,215 @@
 #include <drivers/video/vesa.h>
 #include <lib/string.h>
 
+// ЖЕСТКИЕ КОНСТАНТЫ (Мы сами создаем диск, мы их знаем)
+// Reserved=200, FATs=2, RootEnt=512
+// RootDirSize = 32 sectors
 static uint32_t root_lba = 0;
 static uint32_t data_lba = 0;
 static uint8_t buf[512];
-static uint8_t sec_per_clus = 1;
 
 typedef struct
 {
-    uint8_t n[8], e[3], a, r[10];
-    uint16_t t, d, c;
-    uint32_t s;
-} __attribute__((packed)) E;
+    uint8_t name[8];
+    uint8_t ext[3];
+    uint8_t attr;
+    uint8_t res[10];
+    uint16_t time, date, cluster;
+    uint32_t size;
+} __attribute__((packed)) fat_entry_t;
 
-// читаем BPB для уточнения параметров
-void read_bpb()
+// Преобразование "FILE    TXT" -> "FILE.TXT"
+void fat_to_str(fat_entry_t *e, char *out)
 {
-    ata_read_sector(0, buf);
-    // смещение 13 (0x0D) - Sectors Per Cluster (1 байт)
-    uint8_t spc = buf[0x0D];
-    if (spc > 0 && spc <= 128)
-        sec_per_clus = spc;
-    // смещение 14 (0x0E) - Reserved Sectors (2 байта)
-    uint16_t reserved = *(uint16_t *)(buf + 0x0E);
-    // смещение 16 (0x10) - Number of FATs (1 байт)
-    uint8_t num_fats = buf[0x10];
-    // смещение 22 (0x16) - Sectors Per FAT (2 байта)
-    uint16_t spf = *(uint16_t *)(buf + 0x16);
-
-    // пересчитываем адреса ТОЧНО по формуле
-    if (reserved > 0)
-    {
-        uint32_t fat_start = reserved; // Обычно 200 у нас
-        // Root = Reserved + (Fats * SectorsPerFat)
-        root_lba = reserved + (num_fats * spf);
-        // Data = Root + 32 (для 512 записей)
-        data_lba = root_lba + 32;
-        vesa_print("BPB Read: SPC=");
-        // хак для вывода числа
-        char t[2] = {'0' + sec_per_clus, 0};
-        vesa_print(t);
-        vesa_print("\n");
-    }
-}
-
-void fat_to_str(E *e, char *b)
-{
-    memset(b, 0, 13);
+    memset(out, 0, 13);
     int k = 0;
-    for (int i = 0; i < 8 && e->n[i] != ' '; i++)
-        b[k++] = e->n[i];
-    if (e->e[0] != ' ')
+    for (int i = 0; i < 8 && e->name[i] != ' '; i++)
+        out[k++] = e->name[i];
+    if (e->ext[0] != ' ')
     {
-        b[k++] = '.';
-        for (int i = 0; i < 3 && e->e[i] != ' '; i++)
-            b[k++] = e->e[i];
+        out[k++] = '.';
+        for (int i = 0; i < 3 && e->ext[i] != ' '; i++)
+            out[k++] = e->ext[i];
     }
 }
 
-void str_to_fat(const char *fn, char *n, char *e)
+// Преобразование "file.txt" -> "FILE    TXT"
+void str_to_fat(const char *in, char *name, char *ext)
 {
-    memset(n, ' ', 8);
-    memset(e, ' ', 3);
-    int d = -1, l = 0;
-    for (int i = 0; i < (int)strlen(fn); i++)
-        if (fn[i] == '.')
-            d = i;
-    l = (d == -1) ? strlen(fn) : d;
-    if (l > 8)
-        l = 8;
-    for (int i = 0; i < l; i++)
-        n[i] = toupper(fn[i]);
-    if (d != -1)
+    memset(name, ' ', 8);
+    memset(ext, ' ', 3);
+
+    int dot = -1;
+    int len = strlen(in);
+    for (int i = 0; i < len; i++)
+        if (in[i] == '.')
+            dot = i;
+
+    int name_len = (dot == -1) ? len : dot;
+    if (name_len > 8)
+        name_len = 8;
+
+    for (int i = 0; i < name_len; i++)
+        name[i] = toupper(in[i]);
+
+    if (dot != -1)
+    {
         for (int i = 0; i < 3; i++)
         {
-            if (fn[d + 1 + i] == 0)
+            if (dot + 1 + i >= len)
                 break;
-            e[i] = toupper(fn[d + 1 + i]);
+            ext[i] = toupper(in[dot + 1 + i]);
         }
+    }
 }
 
 void fat16_init()
 {
-    vesa_print("Init FS...\n");
-    // Сначала пробуем прочитать BPB из 0 сектора (если bootloader его не затер полностью)
-    read_bpb();
-
-    // Если BPB показал бред (root_lba=0), запускаем сканер
-    if (root_lba < 100)
+    vesa_print("Mounting FS...\n");
+    // Сканируем диск в поисках Root Directory
+    // Ищем метку тома "ALPHAOS"
+    for (int i = 100; i < 1000; i++)
     {
-        vesa_print("BPB invalid, scanning...\n");
-        for (int i = 200; i < 1000; i++)
+        ata_read_sector(i, buf);
+        fat_entry_t *e = (fat_entry_t *)buf;
+
+        for (int j = 0; j < 16; j++)
         {
-            ata_read_sector(i, buf);
-            E *e = (E *)buf;
-            int found = 0;
-            for (int j = 0; j < 16; j++)
-            {
-                if (memcmp(e[j].n, "LOGO    ", 8) == 0)
-                    found = 1;
-                if (memcmp(e[j].n, "TEST    ", 8) == 0)
-                    found = 1;
-            }
-            if (found)
+            // ATTR 0x08 = Volume ID
+            if (memcmp(e[j].name, "ALPHAOS ", 8) == 0 && e[j].attr == 0x08)
             {
                 root_lba = i;
-                data_lba = root_lba + 32;
-                vesa_print("Scanner Found Root!\n");
+                data_lba = root_lba + 32; // 512 entries * 32 bytes = 32 sectors
+                vesa_print_color("FS Mounted!\n", 0x00FF00);
                 return;
             }
         }
     }
+    vesa_print_color("FS Error: ALPHAOS label missing.\n", 0xFF0000);
 }
 
-uint32_t fat16_read_file(const char *n, uint8_t *out)
-{
-    if (root_lba == 0)
-        return 0;
-    ata_read_sector(root_lba, buf);
-    E *e = (E *)buf;
-    int x = -1;
-    for (int i = 0; i < 16; i++)
-    {
-        if (e[i].n[0] == 0)
-            break;
-        if (e[i].n[0] == 0xE5)
-            continue;
-        char fn[13];
-        fat_to_str(&e[i], fn);
-        if (strcasecmp(n, fn) == 0)
-        {
-            x = i;
-            break;
-        }
-    }
-    if (x == -1)
-        return 0;
-
-    // АДРЕСАЦИЯ С УЧЕТОМ КЛАСТЕРОВ
-    uint32_t start = data_lba + (e[x].c - 2) * sec_per_clus;
-    // Если кластер < 2, это баг или root файл
-    if (e[x].c < 2)
-        start = data_lba + x * sec_per_clus;
-
-    uint32_t bytes_per_clus = sec_per_clus * 512;
-    uint32_t clusters = (e[x].s + bytes_per_clus - 1) / bytes_per_clus;
-
-    for (uint32_t c = 0; c < clusters; c++)
-    {
-        for (int s = 0; s < sec_per_clus; s++)
-        {
-            ata_read_sector(start + c * sec_per_clus + s, out + (c * bytes_per_clus + s * 512));
-        }
-    }
-    return e[x].s;
-}
-
-void fat16_write_file(const char *fn, const char *c, uint32_t len)
-{
-    if (root_lba == 0)
-    {
-        root_lba = 400;
-        data_lba = 432;
-        memset(buf, 0, 512);
-    }
-    else
-        ata_read_sector(root_lba, buf);
-
-    E *e = (E *)buf;
-    int x = -1;
-    char tn[8], te[3];
-    str_to_fat(fn, tn, te);
-
-    for (int i = 0; i < 16; i++)
-        if (memcmp(e[i].n, tn, 8) == 0 && memcmp(e[i].e, te, 3) == 0 && e[i].n[0] != 0xE5)
-        {
-            x = i;
-            break;
-        }
-    if (x == -1)
-        for (int i = 0; i < 16; i++)
-            if (e[i].n[0] == 0 || e[i].n[0] == 0xE5)
-            {
-                x = i;
-                break;
-            }
-    if (x == -1)
-        return;
-
-    memset(&e[x], 0, 32);
-    memcpy(e[x].n, tn, 8);
-    memcpy(e[x].e, te, 3);
-    e[x].c = 2 + x;
-    e[x].s = len; // Принудительно ставим кластер 2+x
-    ata_write_sector(root_lba, buf);
-
-    uint32_t start = data_lba + x * sec_per_clus;
-    uint32_t sc = (len + 511) / 512;
-    for (uint32_t s = 0; s < sc; s++)
-    {
-        memset(buf, 0, 512);
-        int cl = (len - (s * 512) < 512) ? len - (s * 512) : 512;
-        memcpy(buf, c + (s * 512), cl);
-        ata_write_sector(start + s, buf);
-    }
-    vesa_print("Saved.\n");
-}
-void fat16_create_file(const char *n, const char *c) { fat16_write_file(n, c, strlen(c)); }
 void fat16_list_files()
 {
     if (root_lba == 0)
         return;
-    ata_read_sector(root_lba, buf);
-    E *e = (E *)buf;
     vesa_print("Files:\n");
+
+    // Читаем первые 2 сектора каталога
+    for (int s = 0; s < 2; s++)
+    {
+        ata_read_sector(root_lba + s, buf);
+        fat_entry_t *e = (fat_entry_t *)buf;
+
+        for (int i = 0; i < 16; i++)
+        {
+            if (e[i].name[0] == 0)
+                return;
+            if (e[i].name[0] == 0xE5)
+                continue;
+
+            // ФИЛЬТР: Пропускаем LFN (0x0F), VolumeID (0x08), Dir (0x10)
+            if (e[i].attr == 0x0F || e[i].attr == 0x08 || e[i].attr & 0x10)
+                continue;
+
+            char name[13];
+            fat_to_str(&e[i], name);
+            vesa_print("  ");
+            vesa_print(name);
+            vesa_print("\n");
+        }
+    }
+}
+
+uint32_t fat16_read_file(const char *fname, uint8_t *out_buf)
+{
+    if (root_lba == 0)
+        return 0;
+
+    char target_n[8], target_e[3];
+    str_to_fat(fname, target_n, target_e);
+
+    // Поиск файла
+    int cluster = 0;
+    uint32_t size = 0;
+    int found = 0;
+
+    for (int s = 0; s < 4; s++)
+    { // Ищем в первых 4 секторах каталога
+        ata_read_sector(root_lba + s, buf);
+        fat_entry_t *e = (fat_entry_t *)buf;
+
+        for (int i = 0; i < 16; i++)
+        {
+            if (e[i].name[0] == 0)
+                break;
+            if (e[i].name[0] == 0xE5)
+                continue;
+            // Игнорируем не-файлы
+            if (e[i].attr == 0x08 || e[i].attr & 0x10)
+                continue;
+
+            if (memcmp(e[i].name, target_n, 8) == 0 && memcmp(e[i].ext, target_e, 3) == 0)
+            {
+                cluster = e[i].cluster;
+                size = e[i].size;
+                found = 1;
+                goto read;
+            }
+        }
+    }
+    return 0;
+
+read:
+    if (size > 2000000)
+        size = 2000000; // Лимит 2МБ
+    // LBA = DataStart + (Cluster - 2) * SectorsPerCluster (у нас 1)
+    uint32_t start_lba = data_lba + (cluster - 2);
+    uint32_t sectors = (size + 511) / 512;
+
+    for (uint32_t i = 0; i < sectors; i++)
+    {
+        ata_read_sector(start_lba + i, out_buf + (i * 512));
+    }
+    return size;
+}
+
+void fat16_create_file(const char *fname, const char *content)
+{
+    if (root_lba == 0)
+        return;
+    ata_read_sector(root_lba, buf); // Читаем 1-й сектор рута
+    fat_entry_t *e = (fat_entry_t *)buf;
+
+    int idx = -1;
+    // Ищем место
     for (int i = 0; i < 16; i++)
     {
-        if (e[i].n[0] == 0)
+        if (e[i].name[0] == 0 || e[i].name[0] == 0xE5)
+        {
+            idx = i;
             break;
-        if (e[i].n[0] == 0xE5 || e[i].a == 0xF)
-            continue;
-        char fn[13];
-        fat_to_str(&e[i], fn);
-        vesa_print(" ");
-        vesa_print(fn);
-        vesa_print("\n");
+        }
     }
+    if (idx == -1)
+        return;
+
+    memset(&e[idx], 0, 32);
+    str_to_fat(fname, (char *)e[idx].name, (char *)e[idx].ext);
+
+    e[idx].attr = 0x20;         // Archive
+    e[idx].cluster = 100 + idx; // Фейковый кластер для теста
+    e[idx].size = strlen(content);
+
+    ata_write_sector(root_lba, buf);
+
+    // Пишем данные
+    memset(buf, 0, 512);
+    strcpy((char *)buf, content);
+    ata_write_sector(data_lba + (e[idx].cluster - 2), buf);
+    vesa_print("Saved.\n");
+}
+
+void fat16_write_file(const char *n, const char *c, uint32_t l)
+{
+    fat16_create_file(n, c); // Переиспользуем логику
 }
