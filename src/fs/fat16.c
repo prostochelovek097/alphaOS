@@ -3,7 +3,6 @@
 #include <drivers/video/vesa.h>
 #include <lib/string.h>
 
-// ЖЕСТКИЕ КОНСТАНТЫ (Мы сами создаем диск, мы их знаем)
 // Reserved=200, FATs=2, RootEnt=512
 // RootDirSize = 32 sectors
 static uint32_t root_lba = 0;
@@ -20,7 +19,7 @@ typedef struct
     uint32_t size;
 } __attribute__((packed)) fat_entry_t;
 
-// Преобразование "FILE    TXT" -> "FILE.TXT"
+// преобразование "FILE    TXT" -> "FILE.TXT"
 void fat_to_str(fat_entry_t *e, char *out)
 {
     memset(out, 0, 13);
@@ -35,7 +34,7 @@ void fat_to_str(fat_entry_t *e, char *out)
     }
 }
 
-// Преобразование "file.txt" -> "FILE    TXT"
+// преобразование "file.txt" -> "FILE    TXT"
 void str_to_fat(const char *in, char *name, char *ext)
 {
     memset(name, ' ', 8);
@@ -68,8 +67,8 @@ void str_to_fat(const char *in, char *name, char *ext)
 void fat16_init()
 {
     vesa_print("Mounting FS...\n");
-    // Сканируем диск в поисках Root Directory
-    // Ищем метку тома "ALPHAOS"
+    // сканируем диск в поисках Root Directory
+    // ищем метку тома "ALPHAOS"
     for (int i = 100; i < 1000; i++)
     {
         ata_read_sector(i, buf);
@@ -96,7 +95,7 @@ void fat16_list_files()
         return;
     vesa_print("Files:\n");
 
-    // Читаем первые 2 сектора каталога
+    // читаем первые 2 сектора каталога
     for (int s = 0; s < 2; s++)
     {
         ata_read_sector(root_lba + s, buf);
@@ -130,13 +129,13 @@ uint32_t fat16_read_file(const char *fname, uint8_t *out_buf)
     char target_n[8], target_e[3];
     str_to_fat(fname, target_n, target_e);
 
-    // Поиск файла
+    // поиск файла
     int cluster = 0;
     uint32_t size = 0;
     int found = 0;
 
     for (int s = 0; s < 4; s++)
-    { // Ищем в первых 4 секторах каталога
+    { // ищем в первых 4 секторах каталога
         ata_read_sector(root_lba + s, buf);
         fat_entry_t *e = (fat_entry_t *)buf;
 
@@ -163,7 +162,7 @@ uint32_t fat16_read_file(const char *fname, uint8_t *out_buf)
 
 read:
     if (size > 2000000)
-        size = 2000000; // Лимит 2МБ
+        size = 2000000; // лимит 2МБ
     // LBA = DataStart + (Cluster - 2) * SectorsPerCluster (у нас 1)
     uint32_t start_lba = data_lba + (cluster - 2);
     uint32_t sectors = (size + 511) / 512;
@@ -179,7 +178,7 @@ void fat16_create_file(const char *fname, const char *content)
 {
     if (root_lba == 0)
         return;
-    ata_read_sector(root_lba, buf); // Читаем 1-й сектор рута
+    ata_read_sector(root_lba, buf); // читаем 1-й сектор рута
     fat_entry_t *e = (fat_entry_t *)buf;
 
     int idx = -1;
@@ -198,8 +197,8 @@ void fat16_create_file(const char *fname, const char *content)
     memset(&e[idx], 0, 32);
     str_to_fat(fname, (char *)e[idx].name, (char *)e[idx].ext);
 
-    e[idx].attr = 0x20;         // Archive
-    e[idx].cluster = 100 + idx; // Фейковый кластер для теста
+    e[idx].attr = 0x20;         // archive
+    e[idx].cluster = 100 + idx; // фейковый кластер для теста
     e[idx].size = strlen(content);
 
     ata_write_sector(root_lba, buf);
